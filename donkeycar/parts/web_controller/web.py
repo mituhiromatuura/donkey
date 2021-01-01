@@ -10,107 +10,185 @@ remotes.py
 The client and web server needed to control a car remotely.
 """
 
-import random
-
 
 import os
+import json
 import time
+import asyncio
 
-import tornado
-import tornado.ioloop
-import tornado.web
+import requests
+from tornado.ioloop import IOLoop
+from tornado.web import Application, RedirectHandler, StaticFileHandler, \
+    RequestHandler
+from tornado.httpserver import HTTPServer
 import tornado.gen
+import tornado.websocket
+from socket import gethostname
 
-from donkeycar import util
+from ... import utils
+
+
+class RemoteWebServer():
+    '''
+    A controller that repeatedly polls a remote webserver and expects
+    the response to be angle, throttle and drive mode.
+    '''
+
+    def __init__(self, remote_url, connection_timeout=.25):
+
+        self.control_url = remote_url
+        self.time = 0.
+        self.angle = 0.
+        self.throttle = 0.
+        self.mode = 'user'
+        self.recording = False
+        # use one session for all requests
+        self.session = requests.Session()
+
+    def update(self):
+        '''
+        Loop to run in separate thread the updates angle, throttle and
+        drive mode.
+        '''
+
+        while True:
+            # get latest value from server
+            self.angle, self.throttle, self.mode, self.recording = self.run()
+
+    def run_threaded(self):
+        '''
+        Return the last state given from the remote server.
+        '''
+        return self.angle, self.throttle, self.mode, self.recording
+
+    def run(self):
+        '''
+        Posts current car sensor data to webserver and returns
+        angle and throttle recommendations.
+        '''
+
+        data = {}
+        response = None
+        while response is None:
+            try:
+                response = self.session.post(self.control_url,
+                                             files={'json': json.dumps(data)},
+                                             timeout=0.25)
+
+            except requests.exceptions.ReadTimeout as err:
+                print("\n Request took too long. Retrying")
+                # Lower throttle to prevent runaways.
+                return self.angle, self.throttle * .8, None
+
+            except requests.ConnectionError as err:
+                # try to reconnect every 3 seconds
+                print("\n Vehicle could not connect to server. Make sure you've " +
+                    "started your server and you're referencing the right port.")
+                time.sleep(3)
+
+        data = json.loads(response.text)
+        angle = float(data['angle'])
+        throttle = float(data['throttle'])
+        drive_mode = str(data['drive_mode'])
+        recording = bool(data['recording'])
+
+        return angle, throttle, drive_mode, recording
+
+    def shutdown(self):
+        pass
 
 
 class LocalWebController(tornado.web.Application):
-    port = 8887
-    def __init__(self, use_chaos=False):
-        """
+
+    def __init__(self, port=8887, mode='user'):
+        '''
         Create and publish variables needed on many of
         the web handlers.
-        """
-        print('Starting Donkey Server...')
+        '''
+
+        print('Starting Donkey Server...', end='')
 
         this_dir = os.path.dirname(os.path.realpath(__file__))
         self.static_file_path = os.path.join(this_dir, 'templates', 'static')
-
         self.angle = 0.0
         self.throttle = 0.0
-        self.mode = 'user'
+        self.mode = mode
         self.recording = False
-        self.ip_address = util.web.get_ip_address()
-        self.access_url = 'http://{}:{}'.format(self.ip_address, self.port)
+        self.port = port
 
-        self.chaos_on = False
-        self.chaos_counter = 0
-        self.chaos_frequency = 1000 #frames
-        self.chaos_duration = 10
+        self.num_records = 0
+        self.wsclients = []
+        self.loop = None
 
-        if use_chaos:
-            self.run_threaded = self.run_chaos
-        else:
-            self.run_threaded = self._run_threaded
 
         handlers = [
-            (r"/", tornado.web.RedirectHandler, dict(url="/drive")),
+            (r"/", RedirectHandler, dict(url="/drive")),
             (r"/drive", DriveAPI),
+            (r"/wsDrive", WebSocketDriveAPI),
+            (r"/wsCalibrate", WebSocketCalibrateAPI),
+            (r"/calibrate", CalibrateHandler),
             (r"/video", VideoAPI),
-            (r"/static/(.*)", tornado.web.StaticFileHandler, {"path": self.static_file_path}),
+            (r"/wsTest", WsTest),
+
+            (r"/static/(.*)", StaticFileHandler,
+             {"path": self.static_file_path}),
         ]
 
         settings = {'debug': True}
         super().__init__(handlers, **settings)
-
-    def run_chaos(self, img_arr=None):
-        """
-        Run function where steering is made random to add corrective
-        """
-        self.img_arr = img_arr
-        if self.chaos_counter == self.chaos_frequency:
-            self.chaos_on = True
-            random_steering = random.random()
-        elif self.chaos_counter == self.chaos_duration:
-            self.chaos_on = False
-
-        if self.chaos_on:
-            return random_steering, self.throttle, self.mode, False
-        else:
-            return self.angle, self.throttle, self.mode, self.recording
-
-    def say_hello(self):
-        """
-        Print friendly message to user
-        """
-        print("You can now go to {} to drive your car.".format(self.access_url))
+        print("... you can now go to {}.local:{} to drive "
+              "your car.".format(gethostname(), port))
 
     def update(self):
-        """ Start the tornado web server. """
-        self.port = int(self.port)
+        ''' Start the tornado webserver. '''
+        asyncio.set_event_loop(asyncio.new_event_loop())
         self.listen(self.port)
-        instance = tornado.ioloop.IOLoop.instance()
-        instance.add_callback(self.say_hello)
-        instance.start()
+        self.loop = IOLoop.instance()
+        self.loop.start()
 
-    def _run_threaded(self, img_arr=None):
+    def update_wsclients(self):
+        for wsclient in self.wsclients:
+            try:
+                data = {
+                    'num_records': self.num_records
+                }
+                data_str = json.dumps(data)
+                wsclient.write_message(data_str)
+            except Exception as e:
+                print(e)
+                pass
+
+    def run_threaded(self, img_arr=None, num_records=0):
         self.img_arr = img_arr
+        self.num_records = num_records
+
+        # Send record count to websocket clients
+        if (self.num_records is not None and self.recording is True):
+            if self.num_records % 10 == 0:
+                if self.loop is not None:
+                    self.loop.add_callback(self.update_wsclients)
+
         return self.angle, self.throttle, self.mode, self.recording
 
     def run(self, img_arr=None):
-        return self.run_threaded(img_arr)
+        self.img_arr = img_arr
+        return self.angle, self.throttle, self.mode, self.recording
+
+    def shutdown(self):
+        pass
 
 
-class DriveAPI(tornado.web.RequestHandler):
+class DriveAPI(RequestHandler):
+
     def get(self):
         data = {}
         self.render("templates/vehicle.html", **data)
 
     def post(self):
-        """
+        '''
         Receive post requests as user changes the angle
         and throttle of the vehicle on a the index webpage
-        """
+        '''
         data = tornado.escape.json_decode(self.request.body)
         self.application.angle = data['angle']
         self.application.throttle = data['throttle']
@@ -118,32 +196,167 @@ class DriveAPI(tornado.web.RequestHandler):
         self.application.recording = data['recording']
 
 
-class VideoAPI(tornado.web.RequestHandler):
-    """
-    Serves a MJPEG of the images posted from the vehicle.
-    """
-
-    @tornado.web.asynchronous
-    @tornado.gen.coroutine
+class WsTest(RequestHandler):
     def get(self):
+        data = {}
+        self.render("templates/wsTest.html", **data)
 
-        ioloop = tornado.ioloop.IOLoop.current()
-        self.set_header("Content-type", "multipart/x-mixed-replace;boundary=--boundarydonotcross")
 
-        self.served_image_timestamp = time.time()
-        my_boundary = "--boundarydonotcross"
+class CalibrateHandler(RequestHandler):
+    """ Serves the calibration web page"""
+    async def get(self):
+        await self.render("templates/calibrate.html")
+
+
+class WebSocketDriveAPI(tornado.websocket.WebSocketHandler):
+    def check_origin(self, origin):
+        return True
+
+    def open(self):
+        print("New client connected")
+        self.application.wsclients.append(self)
+
+    def on_message(self, message):
+        data = json.loads(message)
+
+        self.application.angle = data['angle']
+        self.application.throttle = data['throttle']
+        self.application.mode = data['drive_mode']
+        self.application.recording = data['recording']
+
+    def on_close(self):
+        # print("Client disconnected")
+        self.application.wsclients.remove(self)
+
+
+class WebSocketCalibrateAPI(tornado.websocket.WebSocketHandler):
+    def check_origin(self, origin):
+        return True
+
+    def open(self):
+        print("New client connected")
+
+    def on_message(self, message):
+        print(f"wsCalibrate {message}")
+        data = json.loads(message)
+        if 'throttle' in data:
+            print(data['throttle'])
+            self.application.throttle = data['throttle']
+
+        if 'angle' in data:
+            print(data['angle'])
+            self.application.angle = data['angle']
+
+        if 'config' in data:
+            config = data['config']
+            if self.application.drive_train_type == "SERVO_ESC":
+                if 'STEERING_LEFT_PWM' in config:
+                    self.application.drive_train['steering'].left_pulse = config['STEERING_LEFT_PWM']
+
+                if 'STEERING_RIGHT_PWM' in config:
+                    self.application.drive_train['steering'].right_pulse = config['STEERING_RIGHT_PWM']
+
+                if 'THROTTLE_FORWARD_PWM' in config:
+                    self.application.drive_train['throttle'].max_pulse = config['THROTTLE_FORWARD_PWM']
+
+                if 'THROTTLE_STOPPED_PWM' in config:
+                    self.application.drive_train['throttle'].zero_pulse = config['THROTTLE_STOPPED_PWM']
+
+                if 'THROTTLE_REVERSE_PWM' in config:
+                    self.application.drive_train['throttle'].min_pulse = config['THROTTLE_REVERSE_PWM']
+
+            elif self.application.drive_train_type == "MM1":
+                if ('MM1_STEERING_MID' in config) and (config['MM1_STEERING_MID'] != 0):
+                        self.application.drive_train.STEERING_MID = config['MM1_STEERING_MID']
+                if ('MM1_MAX_FORWARD' in config) and (config['MM1_MAX_FORWARD'] != 0):
+                        self.application.drive_train.MAX_FORWARD = config['MM1_MAX_FORWARD']
+                if ('MM1_MAX_REVERSE' in config) and (config['MM1_MAX_REVERSE'] != 0):
+                    self.application.drive_train.MAX_REVERSE = config['MM1_MAX_REVERSE']
+
+    def on_close(self):
+        print("Client disconnected")
+
+
+class VideoAPI(RequestHandler):
+    '''
+    Serves a MJPEG of the images posted from the vehicle.
+    '''
+
+    async def get(self):
+
+        self.set_header("Content-type",
+                        "multipart/x-mixed-replace;boundary=--boundarydonotcross")
+
+        served_image_timestamp = time.time()
+        my_boundary = "--boundarydonotcross\n"
         while True:
 
-            interval = .1
-            if self.served_image_timestamp + interval < time.time():
+            interval = .01
+            if served_image_timestamp + interval < time.time() and \
+                    hasattr(self.application, 'img_arr'):
 
-                img = util.img.arr_to_binary(self.application.img_arr)
-
+                img = utils.arr_to_binary(self.application.img_arr)
                 self.write(my_boundary)
                 self.write("Content-type: image/jpeg\r\n")
                 self.write("Content-length: %s\r\n\r\n" % len(img))
                 self.write(img)
-                self.served_image_timestamp = time.time()
-                yield tornado.gen.Task(self.flush)
+                served_image_timestamp = time.time()
+                try:
+                    await self.flush()
+                except tornado.iostream.StreamClosedError:
+                    pass
             else:
-                yield tornado.gen.Task(ioloop.add_timeout, ioloop.time() + interval)
+                await tornado.gen.sleep(interval)
+
+
+class BaseHandler(RequestHandler):
+    """ Serves the FPV web page"""
+    async def get(self):
+        data = {}
+        await self.render("templates/base_fpv.html", **data)
+
+
+class WebFpv(Application):
+    """
+    Class for running an FPV web server that only shows the camera in real-time.
+    The web page contains the camera view and auto-adjusts to the web browser
+    window size. Conjecture: this picture up-scaling is performed by the
+    client OS using graphics acceleration. Hence a web browser on the PC is
+    faster than a pure python application based on open cv or similar.
+    """
+
+    def __init__(self, port=8890):
+        self.port = port
+        this_dir = os.path.dirname(os.path.realpath(__file__))
+        self.static_file_path = os.path.join(this_dir, 'templates', 'static')
+
+        """Construct and serve the tornado application."""
+        handlers = [
+            (r"/", BaseHandler),
+            (r"/video", VideoAPI),
+            (r"/static/(.*)", StaticFileHandler,
+             {"path": self.static_file_path})
+        ]
+
+        settings = {'debug': True}
+        super().__init__(handlers, **settings)
+        print("Started Web FPV server. You can now go to {}.local:{} to "
+              "view the car camera".format(gethostname(), self.port))
+
+    def update(self):
+        """ Start the tornado webserver. """
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        self.listen(self.port)
+        IOLoop.instance().start()
+
+    def run_threaded(self, img_arr=None):
+        self.img_arr = img_arr
+
+    def run(self, img_arr=None):
+        self.img_arr = img_arr
+
+    def shutdown(self):
+        pass
+
+
+

@@ -1,4 +1,4 @@
-__version__ = '2.5.1'
+__version__ = '3.1.5'
 
 print('using donkey v{} ...'.format(__version__))
 
@@ -11,6 +11,7 @@ if sys.version_info.major < 3:
 from . import parts
 from .vehicle import Vehicle
 from .memory import Memory
-from . import util
+from . import utils
 from . import config
+from . import contrib
 from .config import load_config

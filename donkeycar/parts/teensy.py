@@ -8,7 +8,7 @@ class TeensyRCin:
         self.inSteering = 0.0
         self.inThrottle = 0.0
 
-        self.sensor = dk.parts.Teensy(0);
+        self.sensor = dk.parts.actuator.Teensy(0)
 
         TeensyRCin.LEFT_ANGLE = -1.0
         TeensyRCin.RIGHT_ANGLE = 1.0
@@ -24,9 +24,9 @@ class TeensyRCin:
         self.on = True
 
     def map_range(self, x, X_min, X_max, Y_min, Y_max):
-        """
+        '''
         Linear mapping between two ranges of values
-        """
+        '''
         X_range = X_max - X_min
         Y_range = Y_max - Y_min
         XY_ratio = X_range/Y_range
